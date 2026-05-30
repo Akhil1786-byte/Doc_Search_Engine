@@ -1,8 +1,8 @@
 charset_normalizer==3.4.7
 docx==0.2.4
-faiss-cpu==1.13.2
+faiss-cpu
 Flask==2.2.3
-numpy==1.26.4
+numpy
 opencv_contrib_python==4.13.0.92
 pandas==2.3.3
 Pillow==12.2.0
