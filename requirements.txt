@@ -11,6 +11,6 @@ pytesseract==0.3.13
 python_docx==1.2.0
 rank_bm25==0.2.2
 rapidfuzz==3.14.5
-scikit-learn==1.8.0
+scikit-learn
 sentence_transformers==5.5.1
 tqdm==4.67.3
