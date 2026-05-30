@@ -1,643 +1,273 @@
-# =========================
-# Flask App
-# =========================
-
-from flask import (
-    Flask,
-    render_template,
-    request,
-    jsonify,
-    send_from_directory
-)
-
-import os
-import re
-import pickle
-import numpy as np
-import faiss
-
+from flask import Flask, render_template, request, jsonify, send_from_directory
+import os, re, pickle, numpy as np, faiss, traceback
 from sentence_transformers import SentenceTransformer
 from rapidfuzz import process, fuzz
 from sklearn.preprocessing import normalize
 from rank_bm25 import BM25Okapi
 
 # =========================
-# Flask App
+# FLASK APP
 # =========================
-
 app = Flask(__name__)
 
-# =========================
-# Documents Folder
-# =========================
-
 DOCUMENTS_FOLDER = "sample"
+RESULT_PER_PAGE = 20
 
 # =========================
-# Load Model
+# LOAD EMBEDDING MODEL (LIGHT & FAST)
 # =========================
-
-print("Loading model...")
-
-model = SentenceTransformer(
-    "all-MiniLM-L6-v2",
-    device="cpu"
-)
-
-print("Model loaded!")
+print("Loading embedding model...")
+model = SentenceTransformer("all-MiniLM-L6-v2", device="cpu")
+print("Model loaded")
 
 # =========================
-# Load FAISS
+# LOAD FAISS
 # =========================
-
-print("Loading FAISS index...")
-
-index = faiss.read_index(
-    "document_index.faiss"
-)
-
-faiss.omp_set_num_threads(4)
-
-print("FAISS loaded!")
+index = faiss.read_index("document_index.faiss")
+faiss.omp_set_num_threads(2)
 
 # =========================
-# Load Metadata
+# LOAD METADATA
 # =========================
-
-print("Loading metadata...")
-
 with open("metadata.pkl", "rb") as f:
-
     metadata = pickle.load(f)
 
-print("Metadata loaded!")
+# =========================
+# CLEAN TEXT
+# =========================
+def clean_text(text):
+    text = text.lower()
+    text = re.sub(r"[^a-zA-Z0-9\s]", " ", text)
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
 
 # =========================
-# Vocabulary
+# FILE TYPE DETECTION
 # =========================
+def get_file_type(filename):
+    filename = filename.lower()
+    if filename.endswith(".pdf"):
+        return "pdf"
+    elif filename.endswith((".xlsx", ".xls")):
+        return "xlsx"
+    elif filename.endswith(".txt"):
+        return "txt"
+    elif filename.endswith((".docx", ".doc")):
+        return "docx"
+    return "other"
 
-print("Creating vocabulary...")
-
-vocab = set()
+# =========================
+# DOCUMENT LIST (FAST)
+# =========================
+all_documents = []
+seen = set()
 
 for item in metadata:
+    f = item["file"]
+    if f not in seen:
+        seen.add(f)
+        all_documents.append({
+            "file": f,
+            "type": get_file_type(f)
+        })
 
-    text = item["text"].lower()
-
-    text = re.sub(
-        r"[^a-zA-Z0-9\s]",
-        " ",
-        text
-    )
-
-    words = text.split()
-
-    for word in words:
-
-        word = word.strip()
-
-        if len(word) > 2:
-
-            vocab.add(word)
-
+# =========================
+# VOCAB (FOR TYPOS)
+# =========================
+vocab = set()
+for item in metadata:
+    for w in clean_text(item["text"]).split():
+        if len(w) > 2:
+            vocab.add(w)
 vocab = list(vocab)
 
-print(f"Vocabulary Size: {len(vocab)}")
-
 # =========================
-# Typo Correction
+# TYPO FIX
 # =========================
-
 def correct_query(query):
-
-    corrected_words = []
-
-    for word in query.lower().split():
-
-        if len(word) <= 2:
-
-            corrected_words.append(word)
-
+    words = []
+    for w in query.lower().split():
+        if len(w) <= 2:
+            words.append(w)
             continue
 
-        match = process.extractOne(
-
-            word,
-
-            vocab,
-
-            scorer=fuzz.ratio
-
-        )
-
-        if match:
-
-            matched_word = match[0]
-
-            score = match[1]
-
-            if score >= 75:
-
-                corrected_words.append(
-                    matched_word
-                )
-
-            else:
-
-                corrected_words.append(
-                    word
-                )
-
+        match = process.extractOne(w, vocab, scorer=fuzz.ratio)
+        if match and match[1] > 80:
+            words.append(match[0])
         else:
+            words.append(w)
 
-            corrected_words.append(
-                word
-            )
-
-    return " ".join(corrected_words)
+    return " ".join(words)
 
 # =========================
-# Suggestions
+# BM25
 # =========================
-
-print("Creating suggestions...")
-
-suggestions = []
-
-for item in metadata:
-
-    text = item["text"].lower()
-
-    text = re.sub(
-        r"[^a-zA-Z0-9\s]",
-        " ",
-        text
-    )
-
-    words = text.split()
-
-    limit = min(
-        len(words) - 3,
-        15
-    )
-
-    for i in range(limit):
-
-        phrase = " ".join(
-            words[i:i+4]
-        ).strip()
-
-        if len(phrase) > 10:
-
-            suggestions.append({
-
-                "text": phrase,
-
-                "file": item["file"]
-
-            })
+bm25_corpus = [clean_text(m["text"]).split() for m in metadata]
+bm25 = BM25Okapi(bm25_corpus)
 
 # =========================
-# Remove Duplicates
+# SIMPLE FAST QUERY EXPANSION (FIXED)
 # =========================
-
-unique_suggestions = {}
-
-for item in suggestions:
-
-    text = item["text"]
-
-    if text not in unique_suggestions:
-
-        unique_suggestions[text] = item
-
-suggestions = list(
-    unique_suggestions.values()
-)
-
-# Limit suggestions
-suggestions = suggestions[:50000]
-
-print(f"Suggestions: {len(suggestions)}")
-
-# =========================
-# Suggestion Embeddings
-# =========================
-
-print("Creating suggestion embeddings...")
-
-suggestion_texts = [
-
-    item["text"]
-
-    for item in suggestions
-]
-
-suggestion_embeddings = model.encode(
-
-    suggestion_texts,
-
-    batch_size=256,
-
-    convert_to_numpy=True,
-
-    show_progress_bar=True
-
-).astype("float32")
-
-suggestion_embeddings = normalize(
-    suggestion_embeddings
-)
-
-print("Suggestion embeddings ready!")
-
-# =========================
-# Query Expansion
-# =========================
-
 def expand_query(query):
 
-    query_embedding = model.encode(
+    original_words = set(query.lower().split())
 
-        query,
+    expanded = []
+    seen = set()
 
-        convert_to_numpy=True
+    # Limit scan for speed
+    for item in metadata[:300]:
 
-    ).astype("float32")
+        words = clean_text(item["text"]).split()
 
-    query_embedding = normalize(
-        [query_embedding]
-    )[0]
+        for w in words:
 
-    similarities = np.dot(
+            # Skip short words
+            if len(w) < 4:
+                continue
 
-        suggestion_embeddings,
+            # Skip if already in original query
+            if w in original_words:
+                continue
 
-        query_embedding
+            # Skip duplicates in expansion
+            if w in seen:
+                continue
 
-    )
+            seen.add(w)
+            expanded.append(w)
 
-    top_indices = np.argsort(
-        similarities
-    )[-5:][::-1]
+            # limit size
+            if len(expanded) >= 15:
+                break
 
-    expanded_parts = [query]
+        if len(expanded) >= 15:
+            break
 
-    for idx in top_indices:
+    # Final merge: original + clean expansion
+    final = list(dict.fromkeys(query.split() + expanded))
 
-        expanded_parts.append(
-            suggestion_texts[idx]
-        )
-
-    expanded_parts = list(
-        dict.fromkeys(expanded_parts)
-    )
-
-    expanded_query = " ".join(
-        expanded_parts
-    )
-
-    return expanded_query
-
+    return "".join([f"{term}|" for term in final])
 # =========================
-# BM25 Corpus
+# SEARCH ROUTE
 # =========================
-
-print("Creating BM25 corpus...")
-
-bm25_corpus = []
-
-for item in metadata:
-
-    text = item["text"].lower()
-
-    text = re.sub(
-        r"[^a-zA-Z0-9\s]",
-        " ",
-        text
-    )
-
-    tokens = text.split()
-
-    bm25_corpus.append(tokens)
-
-print("BM25 corpus ready!")
-
-# =========================
-# BM25 Index
-# =========================
-
-print("Creating BM25 index...")
-
-bm25 = BM25Okapi(
-    bm25_corpus
-)
-
-print("BM25 ready!")
-
-# =========================
-# Home Route
-# =========================
-
 @app.route("/", methods=["GET", "POST"])
 def home():
 
+    selected_type = request.args.get("type", "all")
+
+    # =========================
+    # SHOW FILE LIST ONLY (SIDEBAR FIX)
+    # =========================
+    if request.method == "GET":
+        docs = [
+            d for d in all_documents
+            if selected_type == "all" or d["type"] == selected_type
+        ]
+
+        return render_template(
+            "index.html",
+            documents=docs,
+            results=[],
+            rag_answer="",
+            corrected_query="",
+            expanded_query="",
+            original_query="",
+            selected_type=selected_type
+        )
+
+    # =========================
+    # SEARCH MODE
+    # =========================
+    query = request.form["query"]
+
+    corrected_query = correct_query(query)
+    expanded_query = expand_query(corrected_query)
+
+    final_query = expanded_query
+
+    # EMBEDDING
+    q_emb = model.encode(final_query, convert_to_numpy=True).astype("float32")
+    q_emb = np.array([q_emb])
+    faiss.normalize_L2(q_emb)
+
+    # FAISS SEARCH
+    scores, idxs = index.search(q_emb, 200)
+
+    scores = scores[0]
+    idxs = idxs[0]
+
+    # BM25
+    bm25_scores = bm25.get_scores(clean_text(final_query).split())
+
     results = []
+    seen_files = set()
 
-    corrected_query = ""
-    expanded_query = ""
-    original_query = ""
+    for i, idx in enumerate(idxs):
 
-    if request.method == "POST":
+        if idx >= len(metadata):
+            continue
 
-        query = request.form["query"]
+        item = metadata[idx]
+        file_name = item["file"]
 
-        original_query = query
+        if file_name in seen_files:
+            continue
 
-        # =========================
-        # Typo Correction
-        # =========================
+        seen_files.add(file_name)
 
-        corrected_query = correct_query(
-            query
-        )
+        hybrid = scores[i] * 0.7 + bm25_scores[idx] * 0.3
 
-        print(
-            "Corrected:",
-            corrected_query
-        )
+        results.append({
+            "file": file_name,
+            "text": item["text"][:500],
+            "score": round(float(hybrid), 4),
+            "type": get_file_type(file_name)
+        })
 
-        # =========================
-        # Query Expansion
-        # =========================
-
-        expanded_query = expand_query(
-            corrected_query
-        )
-
-        print(
-            "Expanded:",
-            expanded_query
-        )
-
-        final_query = expanded_query
-
-        # =========================
-        # Embedding
-        # =========================
-
-        query_embedding = model.encode(
-
-            final_query,
-
-            convert_to_numpy=True
-
-        ).astype("float32")
-
-        query_embedding = np.array(
-            [query_embedding]
-        )
-
-        
-        faiss.normalize_L2(
-            query_embedding
-        )
-
-        # =========================
-        # FAISS Search
-        # =========================
-
-        semantic_top_k = 50
-
-        distances, indices = index.search(
-
-            query_embedding,
-
-            semantic_top_k
-
-        )
-
-        # =========================
-        # BM25 Scores
-        # =========================
-
-        tokenized_query = final_query.lower().split()
-
-        bm25_scores = bm25.get_scores(
-            tokenized_query
-        )
-
-        # =========================
-        # Score Normalization
-        # =========================
-
-        semantic_scores = distances[0]
-
-        semantic_min = semantic_scores.min()
-        semantic_max = semantic_scores.max()
-
-        bm25_selected = []
-
-        for idx in indices[0]:
-
-            bm25_selected.append(
-                bm25_scores[idx]
-            )
-
-        bm25_selected = np.array(
-            bm25_selected
-        )
-
-        bm25_min = bm25_selected.min()
-        bm25_max = bm25_selected.max()
-
-        # =========================
-        # Hybrid Ranking
-        # =========================
-
-        hybrid_results = []
-
-        for i, idx in enumerate(indices[0]):
-
-            if idx >= len(metadata):
-
-                continue
-
-            semantic_score = (
-                semantic_scores[i] - semantic_min
-            ) / (
-                semantic_max - semantic_min + 1e-8
-            )
-
-            keyword_score = (
-                bm25_scores[idx] - bm25_min
-            ) / (
-                bm25_max - bm25_min + 1e-8
-            )
-
-            hybrid_score = (
-
-                semantic_score * 0.7 +
-
-                keyword_score * 0.3
-
-            )
-
-            hybrid_results.append({
-
-                "idx": idx,
-
-                "score": hybrid_score
-
-            })
-
-        # Sort
-        hybrid_results = sorted(
-
-            hybrid_results,
-
-            key=lambda x: x["score"],
-
-            reverse=True
-
-        )
-
-        # =========================
-        # Remove Duplicate Files
-        # =========================
-
-        shown_files = set()
-
-        rank = 1
-
-        for item in hybrid_results:
-
-            idx = item["idx"]
-
-            result = metadata[idx]
-
-            file_name = result["file"]
-
-            if file_name in shown_files:
-
-                continue
-
-            shown_files.add(
-                file_name
-            )
-
-            results.append({
-
-                "rank": rank,
-
-                "file": file_name,
-
-                "text": result["text"][:500],
-
-                "score": round(
-                    item["score"],
-                    4
-                )
-
-            })
-
-            rank += 1
-
-            if rank > 20:
-
-                break
+        if len(results) >= RESULT_PER_PAGE:
+            break
 
     return render_template(
-
         "index.html",
-
+        documents=[],
         results=results,
-
+        rag_answer="",   # GROQ REMOVED (FAST MODE)
         corrected_query=corrected_query,
-
         expanded_query=expanded_query,
-
-        original_query=original_query
+        original_query=query,
+        selected_type=selected_type
     )
 
 # =========================
-# Autocomplete API
+# AUTOCOMPLETE (FAST FIX)
 # =========================
-
 @app.route("/autocomplete")
 def autocomplete():
 
-    query = request.args.get(
-        "q",
-        ""
-    ).lower()
+    q = request.args.get("q", "").lower()
+    if len(q) < 2:
+        return jsonify({"suggestions": []})
 
-    if len(query) < 2:
-
-        return jsonify({
-            "suggestions": []
-        })
-
-    matches = process.extract(
-
-        query,
-
-        suggestion_texts,
-
-        limit=10
-    )
-
-    results = []
-
-    for match in matches:
-
-        matched_text = match[0]
-
-        for item in suggestions:
-
-            if item["text"] == matched_text:
-
-                results.append({
-
-                    "text": item["text"],
-
-                    "file": item["file"]
-
-                })
-
-                break
+    matches = process.extract(q, vocab, limit=8)
 
     return jsonify({
-        "suggestions": results
+        "suggestions": [{"text": m[0]} for m in matches]
     })
 
 # =========================
-# Open Document Route
+# OPEN FILE
 # =========================
-
 @app.route("/open/<path:filename>")
 def open_document(filename):
-
-    print("Opening:", filename)
-
     return send_from_directory(
-
-        os.path.abspath(
-            DOCUMENTS_FOLDER
-        ),
-
+        os.path.abspath(DOCUMENTS_FOLDER),
         filename,
-
         as_attachment=False
     )
 
 # =========================
-# Run App
+# RUN
 # =========================
-
 if __name__ == "__main__":
-
-    app.run(
-        debug=True
-    )
-
+    app.run(debug=True)
