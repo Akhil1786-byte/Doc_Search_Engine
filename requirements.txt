@@ -1,6 +1,6 @@
 charset_normalizer==3.4.7
 docx==0.2.4
-faiss==1.5.3
+faiss==1.8.0
 fitz==0.0.1.dev2
 Flask==2.2.3
 numpy==2.4.6
